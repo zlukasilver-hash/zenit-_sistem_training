@@ -2345,3 +2345,13 @@ body[data-theme="parchment"] .zenith-toast {
     opacity: 0.7;
   }
 }
+
+.battle-bar-card-hidden .battle-bar-track-hidden {
+  background: rgba(255,255,255,0.04);
+}
+
+.battle-bar-card-hidden .battle-bar-fill-hidden {
+  width: 0 !important;
+  box-shadow: none;
+  background: transparent;
+}

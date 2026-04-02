@@ -686,8 +686,10 @@ function createDefaultTrainingProgress() {
     creditedWins: 0,
     creditedLosses: 0,
     creditedDraws: 0,
-    unfinishedTrainings: 0,
-    deniedTrainings: 0
+unfinishedTrainings: 0,
+deniedTrainings: 0,
+lastProcessedMatchId: "",
+lastProcessedMatchAt: 0
   };
 }
 
@@ -769,8 +771,10 @@ function normalizeTrainingProgress(raw) {
     creditedWins: raw?.creditedWins ?? base.creditedWins,
     creditedLosses: raw?.creditedLosses ?? base.creditedLosses,
     creditedDraws: raw?.creditedDraws ?? base.creditedDraws,
-    unfinishedTrainings: raw?.unfinishedTrainings ?? base.unfinishedTrainings,
-    deniedTrainings: raw?.deniedTrainings ?? base.deniedTrainings
+unfinishedTrainings: raw?.unfinishedTrainings ?? base.unfinishedTrainings,
+deniedTrainings: raw?.deniedTrainings ?? base.deniedTrainings,
+lastProcessedMatchId: raw?.lastProcessedMatchId ?? base.lastProcessedMatchId,
+lastProcessedMatchAt: raw?.lastProcessedMatchAt ?? base.lastProcessedMatchAt
   };
 }
 
@@ -886,6 +890,8 @@ function normalizeBattle(raw) {
     lastMessage: raw?.lastMessage || "Тренировка началась.",
     log: safeArray(raw?.log),
     pendingRoundCards: safeArray(raw?.pendingRoundCards),
+    queuedActions: raw?.queuedActions || {},
+roundResolvedAt: raw?.roundResolvedAt ?? 0,
     finished: Boolean(raw?.finished),
     winnerSide: raw?.winnerSide || "",
     winnerUid: raw?.winnerUid || "",
@@ -2278,6 +2284,8 @@ async function createBattleFromRoom(room) {
     lastMessage: `Тренировка началась. Первый ход делает ${fighters[queue[0]]?.characterName || "—"}.`,
     log: [],
     pendingRoundCards: [],
+    queuedActions: {},
+roundResolvedAt: 0,
     finished: false,
     winnerSide: "",
     winnerUid: "",
@@ -2322,6 +2330,18 @@ function getAliveFighterIds(battle) {
     const fighter = battle.fighters[uid];
     return fighter && fighter.alive && !fighter.escaped;
   });
+}
+
+function getAliveSelectableFighterIds(battle) {
+  return Object.keys(battle.fighters).filter(uid => {
+    const fighter = battle.fighters[uid];
+    return fighter && fighter.alive && !fighter.escaped;
+  });
+}
+
+function haveAllAliveFightersQueuedAction(battle) {
+  const aliveIds = getAliveSelectableFighterIds(battle);
+  return aliveIds.length > 0 && aliveIds.every(uid => Boolean(battle.queuedActions?.[uid]));
 }
 
 function getCurrentFighterId(battle) {
@@ -2504,28 +2524,34 @@ function getEscapeOutcomeForDuel(battle, actorUid) {
   };
 }
 
-function tryDefenderDodge(defender, defenderName, actionLabel, logs) {
-  if ((defender.effects.guardCharges || 0) <= 0) return false;
-  defender.effects.guardCharges = 0;
+function tryDefenderDodge(defender, defenderName, actionLabel, logs, defenseState) {
+  if (!defenseState?.active || defenseState.used) return false;
+
+  defenseState.used = true;
+
   const dodgeChance = clamp(CHANCES.dodge + (defender.combat.dodge || 0), 0, 95);
   const dodgeRoll = randomRoll();
+
   if (dodgeRoll <= dodgeChance) {
-    logs.push(`${defenderName} успевает увернуться от приёма «${actionLabel}». Бросок уворота: ${dodgeRoll} из ${dodgeChance}.`);
+    logs.push(`${defenderName} уходит в защиту и успевает увернуться от приёма «${actionLabel}». Бросок уворота: ${dodgeRoll} из ${dodgeChance}.`);
     return true;
   }
-  logs.push(`${defenderName} пытается увернуться от приёма «${actionLabel}», но не успевает. Бросок уворота: ${dodgeRoll} из ${dodgeChance}.`);
+
+  logs.push(`${defenderName} уходит в защиту, но не успевает увернуться от приёма «${actionLabel}». Бросок уворота: ${dodgeRoll} из ${dodgeChance}.`);
   return false;
 }
 
-function resolveAttackAction(battle, attackerUid, action, logs) {
+function resolveAttackAction(battle, attackerUid, action, logs, defenseMap = {}) {
   const attacker = battle.fighters[attackerUid];
   const defender = battle.fighters[action.targetUid];
-  if (!attacker || !defender || !attacker.alive || attacker.escaped || !defender.alive || defender.escaped) return;
+
+  if (!attacker || !defender || attacker.escaped || !defender.alive || defender.escaped) return;
   if (!areEnemies(battle, attackerUid, action.targetUid)) return;
 
   const attackerName = attacker.characterName;
   const defenderName = defender.characterName;
   const penalty = attacker.effects.accuracyPenaltyTurns > 0 ? SAND_ACCURACY_PENALTY : 0;
+
   let chance = 0;
   let actionLabel = "";
   let bodyTarget = null;
@@ -2549,7 +2575,8 @@ function resolveAttackAction(battle, attackerUid, action, logs) {
 
   chance = clamp(chance, 0, 95);
 
-  if (tryDefenderDodge(defender, defenderName, actionLabel, logs)) {
+  const defenseState = defenseMap[action.targetUid];
+  if (tryDefenderDodge(defender, defenderName, actionLabel, logs, defenseState)) {
     recordAnalyticsForAction(attacker.analytics, action, false);
     return;
   }
@@ -2581,7 +2608,7 @@ function resolveAttackAction(battle, attackerUid, action, logs) {
     defender.hp = Math.max(0, defender.hp - directDamage);
     defender.effects.pendingDotDamage += dotDamage;
     logs.push(`${attackerName} попадает лапой в ${bodyTarget.label}. Бросок: ${roll} из ${chance}.`);
-    logs.push(`${defenderName} теряет ${directDamage}% очков спарринга и получает кровотечение ${dotDamage}% на следующие ходы.`);
+    logs.push(`${defenderName} теряет ${directDamage}% очков спарринга и получает потерю ${dotDamage}% очков спарринга на следующие ходы.`);
     if (defender.hp <= 0) {
       defender.alive = false;
       logs.push(`${defenderName} падает до 0% и выбывает из тренировки.`);
@@ -2596,7 +2623,7 @@ function resolveAttackAction(battle, attackerUid, action, logs) {
     defender.effects.pendingDotDamage += dotDamage;
     defender.effects.stunTurns += 1;
     logs.push(`${attackerName} проводит подсечку. Попадание. Бросок: ${roll} из ${chance}.`);
-    logs.push(`${defenderName} теряет ${directDamage}% очков спарринга, оглушается на следующий ход и получает кровотечение ${dotDamage}%.`);
+    logs.push(`${defenderName} теряет ${directDamage}% очков спарринга, оглушается на следующий ход и получает потерю ${dotDamage}% очков спарринга на следующие ходы.`);
     if (defender.hp <= 0) {
       defender.alive = false;
       logs.push(`${defenderName} падает до 0% и выбывает из тренировки.`);
@@ -2614,7 +2641,7 @@ function applyStartOfTurnEffects(battle, fighterUid, logs) {
 
   if (fighter.effects.dotDamage > 0) {
     fighter.hp = Math.max(0, fighter.hp - fighter.effects.dotDamage);
-    logs.push(`${fighter.characterName} теряет ${fighter.effects.dotDamage}% очков спарринга из-за кровотечения.`);
+    logs.push(`${fighter.characterName} теряет ${fighter.effects.dotDamage}% очков спарринга из-за продолжающейся потери сил.`);
     if (fighter.hp <= 0) {
       fighter.alive = false;
       logs.push(`${fighter.characterName} падает до 0% ещё до действия и выбывает.`);
@@ -2700,6 +2727,170 @@ function finishBattleObject(battle, outcome, finalCardHtml = "") {
   appendBattleLog(battle, [
     `<div class="battle-finish-note">${escapeHtml(battle.lastMessage)}</div>`
   ]);
+}
+
+function resolveRound(battle) {
+  const roundNumber = battle.roundNumber;
+  const actorOrder = getAliveSelectableFighterIds(battle).filter(uid => Boolean(battle.queuedActions?.[uid]));
+  const logsMap = {};
+  const roundState = {};
+  const defenseMap = {};
+
+  actorOrder.forEach(uid => {
+    logsMap[uid] = [];
+    roundState[uid] = applyStartOfTurnEffects(battle, uid, logsMap[uid]);
+  });
+
+  let outcome = getBattleWinnerState(battle);
+  if (outcome.finished) {
+    actorOrder.forEach(uid => {
+      const fighter = battle.fighters[uid];
+      addRoundCard(
+        battle,
+        buildBattleTurnCard(
+          fighter?.characterName || "Боец",
+          roundNumber,
+          logsMap[uid].length ? logsMap[uid] : ["Бой завершается до действия."],
+          "danger"
+        )
+      );
+    });
+
+    battle.queuedActions = {};
+    battle.roundResolvedAt = now();
+    finishBattleObject(battle, outcome);
+    return;
+  }
+
+  actorOrder.forEach(uid => {
+    const fighter = battle.fighters[uid];
+    const action = battle.queuedActions?.[uid];
+
+    if (!fighter || !action || roundState[uid]?.skipped || !fighter.alive || fighter.escaped) return;
+
+    if (action.kind === "defend") {
+      if (fighter.effects.dodgesLeft <= 0) {
+        logsMap[uid].push(`${fighter.characterName} пытается уйти в защиту, но у него закончились увороты.`);
+      } else {
+        fighter.effects.dodgesLeft -= 1;
+        defenseMap[uid] = { active: true, used: false };
+        logsMap[uid].push(`${fighter.characterName} уходит в защиту и старается уклониться от первого удара этого раунда.`);
+      }
+    }
+  });
+
+  let duelEscapeOutcome = null;
+
+  actorOrder.forEach(uid => {
+    const fighter = battle.fighters[uid];
+    const action = battle.queuedActions?.[uid];
+    const mode = GROUP_MODES[battle.modeId] || GROUP_MODES.duel;
+
+    if (!fighter || !action || roundState[uid]?.skipped || !fighter.alive || fighter.escaped) return;
+    if (action.kind !== "escape") return;
+
+    if (mode.id === "duel") {
+      if (!duelEscapeOutcome) {
+        duelEscapeOutcome = getEscapeOutcomeForDuel(battle, uid);
+        logsMap[uid].push(duelEscapeOutcome.message);
+      }
+      return;
+    }
+
+    fighter.escaped = true;
+    logsMap[uid].push(`${fighter.characterName} покидает тренировку и выбывает из боя.`);
+  });
+
+  if (duelEscapeOutcome) {
+    actorOrder.forEach(uid => {
+      const fighter = battle.fighters[uid];
+      addRoundCard(
+        battle,
+        buildBattleTurnCard(
+          fighter?.characterName || "Боец",
+          roundNumber,
+          logsMap[uid].length ? logsMap[uid] : ["Раунд завершён."],
+          "danger"
+        )
+      );
+    });
+
+    battle.queuedActions = {};
+    battle.roundResolvedAt = now();
+    finishBattleObject(battle, duelEscapeOutcome);
+    return;
+  }
+
+  actorOrder.forEach(uid => {
+    const fighter = battle.fighters[uid];
+    const action = battle.queuedActions?.[uid];
+
+    if (!fighter || !action || roundState[uid]?.skipped || !fighter.alive || fighter.escaped) return;
+
+    if (action.kind === "multiAttack") {
+      const attacks = safeArray(action.actions);
+
+      if (!attacks.length) {
+        logsMap[uid].push(`${fighter.characterName} медлит и не наносит ударов.`);
+        return;
+      }
+
+      attacks.forEach(item => {
+        resolveAttackAction(battle, uid, item, logsMap[uid], defenseMap);
+      });
+    }
+  });
+
+  actorOrder.forEach(uid => {
+    const fighter = battle.fighters[uid];
+    if (!fighter) return;
+
+    if (!roundState[uid]?.skipped && fighter.effects.accuracyPenaltyTurns > 0) {
+      fighter.effects.accuracyPenaltyTurns -= 1;
+    }
+  });
+
+  Object.values(battle.fighters).forEach(fighter => {
+    if (fighter.effects.pendingDotDamage > 0) {
+      fighter.effects.dotDamage += fighter.effects.pendingDotDamage;
+      fighter.effects.pendingDotDamage = 0;
+    }
+  });
+
+  battle.lastActionAt = now();
+  battle.inactivityDeadlineAt = now() + INACTIVITY_TIMEOUT_MS;
+
+  actorOrder.forEach(uid => {
+    const fighter = battle.fighters[uid];
+    const accent = roundState[uid]?.skipped
+      ? "danger"
+      : defenseMap[uid]?.active
+        ? "good"
+        : "default";
+
+    addRoundCard(
+      battle,
+      buildBattleTurnCard(
+        fighter?.characterName || "Боец",
+        roundNumber,
+        logsMap[uid].length ? logsMap[uid] : ["Ничего не произошло."],
+        accent
+      )
+    );
+  });
+
+  battle.queuedActions = {};
+  battle.roundResolvedAt = now();
+
+  outcome = getBattleWinnerState(battle);
+  if (outcome.finished) {
+    finishBattleObject(battle, outcome);
+    return;
+  }
+
+  flushPendingRoundCardsNow(battle);
+  battle.roundNumber += 1;
+  battle.lastMessage = "Раунд завершён. Выберите действие следующего раунда.";
 }
 
 function processBattleAction(battle, actorUid, action) {
@@ -2838,30 +3029,50 @@ async function submitBattleAction(action) {
   }
 
   const roomRef = ref(db, getRoomPath(state.currentRoomCode));
+
   await runTransaction(roomRef, raw => {
     if (!raw) return raw;
+
     const room = normalizeRoom(raw);
     if (room.status !== "battle" || !room.battle) return raw;
 
     const battle = normalizeBattle(room.battle);
-    const actorUid = getCurrentFighterId(battle);
-    if (actorUid !== state.user.uid) return raw;
+    const actorUid = state.user?.uid;
+    const actor = battle.fighters[actorUid];
 
-    processBattleAction(battle, actorUid, action);
+    if (!actor || !actor.alive || actor.escaped) return raw;
+    if (battle.finished) return raw;
 
-    room.battle = battle;
-    room.status = battle.finished ? "finished" : "battle";
-    room.finishInfo = battle.finished
-      ? {
-          completedAt: battle.completedAt,
-          winnerSide: battle.winnerSide,
-          winnerUid: battle.winnerUid,
-          reason: battle.finishReason,
-          message: battle.lastMessage
-        }
-      : null;
+    if (battle.queuedActions?.[actorUid]) {
+      return raw;
+    }
 
-    return room;
+    battle.queuedActions = {
+      ...(battle.queuedActions || {}),
+      [actorUid]: action
+    };
+
+    if (haveAllAliveFightersQueuedAction(battle)) {
+  resolveRound(battle);
+
+  room.battle = battle;
+  room.status = battle.finished ? "finished" : "battle";
+  room.finishInfo = battle.finished
+    ? {
+        completedAt: battle.completedAt,
+        winnerSide: battle.winnerSide,
+        winnerUid: battle.winnerUid,
+        reason: battle.finishReason,
+        message: battle.lastMessage
+      }
+    : null;
+
+  return room;
+}
+
+battle.lastMessage = "Действие выбрано. Ждём остальных участников.";
+room.battle = battle;
+return room;
   });
 }
 
@@ -2875,9 +3086,16 @@ function startAttackPlanning() {
   const battle = room?.battle ? normalizeBattle(room.battle) : null;
   if (!battle) return;
 
-  const actorUid = getCurrentFighterId(battle);
-  if (actorUid !== state.user?.uid) {
-    notifyError("Сейчас ходит не ваш персонаж.");
+  const actorUid = state.user?.uid;
+  const actor = battle.fighters[actorUid];
+
+  if (!actor || !actor.alive || actor.escaped) {
+    notifyError("Ваш персонаж сейчас не может действовать.");
+    return;
+  }
+
+  if (battle.queuedActions?.[actorUid]) {
+    notifyError("Вы уже выбрали действие этого раунда.");
     return;
   }
 
@@ -2903,7 +3121,7 @@ function startAttackPlanning() {
 
 function updatePlanningBadge() {
   if (!state.planningAttack) {
-    text(ui.battle.opponentChosenBadge, "Ожидание действий");
+    text(ui.battle.opponentChosenBadge, "Выбор цели");
     return;
   }
 
@@ -2980,18 +3198,18 @@ function renderBattleBars(battle, viewerUid) {
     const deadLabel = !fighter.alive ? " · выбыл" : fighter.escaped ? " · ушёл" : "";
 
     if (!isVisible) {
-      return `
-        <div class="battle-bar-card battle-bar-card-hidden">
-          <div class="battle-bar-top">
-            <span>${escapeHtml(fighter.characterName)}${escapeHtml(deadLabel)}</span>
-            <strong>✦✦✦</strong>
-          </div>
-          <div class="battle-bar-track battle-bar-track-hidden">
-            <div class="battle-bar-fill battle-bar-fill-hidden" style="width:100%"></div>
-          </div>
-        </div>
-      `;
-    }
+  return `
+    <div class="battle-bar-card battle-bar-card-hidden">
+      <div class="battle-bar-top">
+        <span>${escapeHtml(fighter.characterName)}${escapeHtml(deadLabel)}</span>
+        <strong>Скрыто</strong>
+      </div>
+      <div class="battle-bar-track battle-bar-track-hidden">
+        <div class="battle-bar-fill battle-bar-fill-hidden" style="width:0%"></div>
+      </div>
+    </div>
+  `;
+}
 
     return `
       <div class="battle-bar-card">
@@ -3019,7 +3237,7 @@ function getDodgeSymbols(left) {
 function renderMyBattleEffects(fighter) {
   if (!fighter) return "";
   const stunned = fighter.effects.stunTurns > 0 ? "Да" : "Нет";
-  const bleeding = fighter.effects.dotDamage > 0 ? `🩸 ${fighter.effects.dotDamage}%` : "Спокойно";
+  const ongoingLoss = fighter.effects.dotDamage > 0 ? `−${fighter.effects.dotDamage}%` : "Нет";
   const penalty = fighter.effects.accuracyPenaltyTurns > 0 ? `☾ ${fighter.effects.accuracyPenaltyTurns} х.` : "Чистый взгляд";
 
   return `
@@ -3029,8 +3247,8 @@ function renderMyBattleEffects(fighter) {
         <strong>${escapeHtml(getDodgeSymbols(fighter.effects.dodgesLeft))}</strong>
       </div>
       <div class="battle-effect-chip">
-        <span class="battle-effect-chip-label">Кровотечение</span>
-        <strong>${escapeHtml(bleeding)}</strong>
+        <span class="battle-effect-chip-label">Потеря очков спарринга</span>
+        <strong>${escapeHtml(ongoingLoss)}</strong>
       </div>
       <div class="battle-effect-chip">
         <span class="battle-effect-chip-label">Оглушение</span>
@@ -3068,25 +3286,31 @@ function setBattleLog(logItems) {
 }
 
 function renderBattleForPlayer(room, battle) {
-  const currentUid = getCurrentFighterId(battle);
-  const isMine = currentUid === state.user?.uid;
-  const currentFighter = battle.fighters[currentUid];
-  const myFighter = state.user ? battle.fighters[state.user.uid] : null;
+  const myUid = state.user?.uid || "";
+  const myFighter = myUid ? battle.fighters[myUid] : null;
   const myEnemies = myFighter
-    ? getEnemyFighterIds(battle, state.user.uid).map(uid => battle.fighters[uid]?.characterName).filter(Boolean)
+    ? getEnemyFighterIds(battle, myUid).map(uid => battle.fighters[uid]?.characterName).filter(Boolean)
     : [];
+
+  const alreadyChosen = Boolean(battle.queuedActions?.[myUid]);
+  const canChooseAction =
+    !battle.finished &&
+    !!myFighter &&
+    myFighter.alive &&
+    !myFighter.escaped &&
+    !alreadyChosen;
 
   html(ui.battle.info, `
     <div class="battle-status-shell">
       <div class="battle-status-top">
-        <span class="battle-chip ${isMine ? "battle-chip-active" : "battle-chip-soft"}">
-          ${isMine ? "Ваш ход" : "Ожидание хода"}
+        <span class="battle-chip ${canChooseAction ? "battle-chip-active" : "battle-chip-soft"}">
+          ${battle.finished ? "Тренировка завершена" : alreadyChosen ? "Действие выбрано" : "Выбор действия"}
         </span>
         <span class="battle-chip">Режим: ${escapeHtml(getModeLabel(battle.modeId))}</span>
         <span class="battle-chip">Раунд: ${battle.roundNumber}</span>
       </div>
 
-      <div class="battle-bars-wrap">${renderBattleBars(battle, state.user?.uid)}</div>
+      <div class="battle-bars-wrap">${renderBattleBars(battle, myUid)}</div>
 
       <div class="battle-message">
         <div class="battle-message-title">✦ Текущее состояние</div>
@@ -3094,9 +3318,9 @@ function renderBattleForPlayer(room, battle) {
           ${escapeHtml(
             battle.finished
               ? battle.lastMessage || "Тренировка завершена."
-              : isMine
-                ? "Можно выбирать действие."
-                : "Ждём завершения круга."
+              : alreadyChosen
+                ? "Ваш выбор принят. Ждём остальных участников."
+                : "Выберите действие этого раунда."
           )}
         </div>
       </div>
@@ -3113,10 +3337,12 @@ function renderBattleForPlayer(room, battle) {
   setBattleLog(battle.log);
 
   const defendDisabled = !myFighter || myFighter.effects.dodgesLeft <= 0;
+  const disableAll = battle.finished || !canChooseAction;
 
-  if (battle.finished || !isMine || !myFighter || !myFighter.alive || myFighter.escaped) {
+  if (disableAll) {
     setBattleButtonsDisabled(true, true);
     showBattleMainActions();
+    updatePlanningBadge();
     return;
   }
 
@@ -3647,9 +3873,14 @@ function applyBattleOutcomeToCharacter({
   finishedAt,
   creditGranted,
   creditReason,
-  analyticsDelta
+  analyticsDelta,
+  matchId
 }) {
   const next = deepClone(normalizeCharacter(character));
+
+  if (matchId && next.training.progress.lastProcessedMatchId === matchId) {
+    return next;
+  }
   const thresholds = getThresholdsForStatus(next.trainingStatus);
 
   if (resultType === RESULT_TYPES.WIN) next.profileStats.wins += 1;
@@ -3672,16 +3903,20 @@ function applyBattleOutcomeToCharacter({
   }
 
   if (resultType === RESULT_TYPES.UNFINISHED) {
-    next.training.progress.unfinishedTrainings += 1;
-    next.updatedAt = finishedAt;
-    return next;
-  }
+  next.training.progress.unfinishedTrainings += 1;
+  next.training.progress.lastProcessedMatchId = matchId || "";
+  next.training.progress.lastProcessedMatchAt = finishedAt;
+  next.updatedAt = finishedAt;
+  return next;
+}
 
   if (!creditGranted) {
-    next.training.progress.deniedTrainings += 1;
-    next.updatedAt = finishedAt;
-    return next;
-  }
+  next.training.progress.deniedTrainings += 1;
+  next.training.progress.lastProcessedMatchId = matchId || "";
+  next.training.progress.lastProcessedMatchAt = finishedAt;
+  next.updatedAt = finishedAt;
+  return next;
+}
 
   next.training.progress.creditedTrainings += 1;
   next.training.progress.lastCreditedAt = finishedAt;
@@ -3700,21 +3935,23 @@ function applyBattleOutcomeToCharacter({
   }
 
   if (canEarnAnyMoreUpgrades(next)) {
-    const earnedByWins = Math.floor(next.training.progress.winsTowardUpgrade / thresholds.wins);
-    const earnedByLosses = Math.floor(next.training.progress.lossesTowardUpgrade / thresholds.losses);
-    const earnedNow = earnedByWins + earnedByLosses;
+  const earnedByWins = Math.floor(next.training.progress.winsTowardUpgrade / thresholds.wins);
+  const earnedByLosses = Math.floor(next.training.progress.lossesTowardUpgrade / thresholds.losses);
+  const earnedNow = earnedByWins + earnedByLosses;
 
-    if (earnedNow > 0) {
-      next.training.progress.winsTowardUpgrade -= earnedByWins * thresholds.wins;
-      next.training.progress.lossesTowardUpgrade -= earnedByLosses * thresholds.losses;
+  if (earnedNow > 0) {
+    next.training.progress.winsTowardUpgrade -= earnedByWins * thresholds.wins;
+    next.training.progress.lossesTowardUpgrade -= earnedByLosses * thresholds.losses;
 
-      const withPoints = addPendingUpgradePoints(next, earnedNow);
-      next.training = withPoints.training;
-    }
+    const withPoints = addPendingUpgradePoints(next, earnedNow);
+    next.training = withPoints.training;
   }
+}
 
-  next.updatedAt = finishedAt;
-  return next;
+next.training.progress.lastProcessedMatchId = matchId || "";
+next.training.progress.lastProcessedMatchAt = finishedAt;
+next.updatedAt = finishedAt;
+return next;
 }
 
 async function saveFinishedMatchIfNeeded(roomCode, room) {
@@ -3757,14 +3994,15 @@ async function saveFinishedMatchIfNeeded(roomCode, room) {
       .join(", ");
 
     const next = applyBattleOutcomeToCharacter({
-      character,
-      resultType: getParticipantResult(latestRoom, participant.uid),
-      opponentName: enemyNames,
-      finishedAt,
-      creditGranted: Boolean(preview.eligibleByParticipant?.[participant.uid]?.getsCredit),
-      creditReason: preview.eligibleByParticipant?.[participant.uid]?.reason || preview.reason,
-      analyticsDelta: battle?.fighters?.[participant.uid]?.analytics || createBattleAnalyticsBlock()
-    });
+  character,
+  resultType: getParticipantResult(latestRoom, participant.uid),
+  opponentName: enemyNames,
+  finishedAt,
+  creditGranted: Boolean(preview.eligibleByParticipant?.[participant.uid]?.getsCredit),
+  creditReason: preview.eligibleByParticipant?.[participant.uid]?.reason || preview.reason,
+  analyticsDelta: battle?.fighters?.[participant.uid]?.analytics || createBattleAnalyticsBlock(),
+  matchId: historyRef.key
+});
 
     await set(ref(db, getCharacterPath(participant.uid, participant.characterId)), next);
   }
